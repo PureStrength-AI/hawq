@@ -234,7 +234,7 @@ def main_worker_gpt(gpu, ngpus_per_node, args):
     if not hasattr(args, 'bias_bit') or args.bias_bit is None:
         args.bias_bit = 32
 
-    quantize_bias = (args.bias_bit != 0)
+    quantize_bias = (args.bias_bit != 32)
 
     # -----------------------------
     # Data Loading and Tokenization
