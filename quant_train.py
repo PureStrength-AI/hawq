@@ -436,7 +436,6 @@ def main_worker_gpt(gpu, ngpus_per_node, args):
             self.fc_out.set_param(original_att.fc_out)
 
         def forward(self, x):
-            logging.info(f"Q_MultiHeadAttention: {x.shape}")
             B, seq_len, _ = x.shape
             q, qs = self.quant_act(self.query(x))
             k, ks = self.quant_act(self.key(x))
@@ -450,7 +449,6 @@ def main_worker_gpt(gpu, ngpus_per_node, args):
             att_weights = torch.softmax(scores, dim=-1)
             out = torch.matmul(att_weights, v)
             out = out.transpose(1,2).contiguous().view(B, seq_len, self.dim)
-            logging.info(f"Q_MultiHeadAttention: {vs}")
             out, outs = self.quant_act_int32(self.fc_out(out, vs))
             return out
 
@@ -478,7 +476,6 @@ def main_worker_gpt(gpu, ngpus_per_node, args):
             self.linear2.set_param(original_fcn[2])
 
         def forward(self, x):
-            logging.info(f"Q_FeedForward: {x.shape}")
             x, xs = self.quant_act(self.linear1(x))
             x = self.activation(x)
             x, x2s = self.quant_act_int32(self.linear2(x, xs))
