@@ -628,8 +628,12 @@ def main_worker_gpt(gpu, ngpus_per_node, args):
     model = Q_GPT(base_model, bit_config_gpt_uniform8).to(device)
     logging.info(model)
 
+    logging.info(args)
+    
     for name, m in model.named_modules():
+        logging.info(f"Module: {name}")
         if name in bit_config_gpt_uniform8.keys():
+            logging.info(f"Setting quantization parameters for {name}")
             setattr(m, 'quant_mode', 'symmetric')
             setattr(m, 'bias_bit', args.bias_bit)
             setattr(m, 'quantize_bias', quantize_bias)
