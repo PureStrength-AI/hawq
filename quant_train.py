@@ -427,6 +427,14 @@ def main_worker_gpt(gpu, ngpus_per_node, args):
             self.quant_act_int32 = QuantAct(activation_bit=bit_config['blocks.0.att.quant_act_int32'])
             self.dropout = nn.Dropout(0.2)
 
+        def set_param(self, original_att):
+            # original_att is the MultiHeadAttention from the original GPTBlock
+            # It has query, key, value, fc_out as nn.Linear layers.
+            self.query.set_param(original_att.query)
+            self.key.set_param(original_att.key)
+            self.value.set_param(original_att.value)
+            self.fc_out.set_param(original_att.fc_out)
+
         def forward(self, x):
             logging.info(f"Q_MultiHeadAttention: {x.shape}")
             B, seq_len, _ = x.shape
@@ -455,13 +463,19 @@ def main_worker_gpt(gpu, ngpus_per_node, args):
             self.linear1 = QuantLinear(weight_bit=bit_config['blocks.0.fcn.0.quant_weight'])
             self.linear2 = QuantLinear(weight_bit=bit_config['blocks.0.fcn.2.quant_weight'])
 
-            # Initialize from standard Linear layers
+            # Temporary initialization, set_param will overwrite these
             l1 = nn.Linear(dim, 4*dim)
             l2 = nn.Linear(4*dim, dim)
             self.linear1.set_param(l1)
             self.linear2.set_param(l2)
 
             self.activation = nn.GELU()
+
+        def set_param(self, original_fcn):
+            # original_fcn is a nn.Sequential: [Linear(d_model,4*d_model), GELU, Linear(4*d_model,d_model)]
+            # so original_fcn[0] and original_fcn[2] are the linear layers.
+            self.linear1.set_param(original_fcn[0])
+            self.linear2.set_param(original_fcn[2])
 
         def forward(self, x):
             logging.info(f"Q_FeedForward: {x.shape}")
@@ -478,6 +492,16 @@ def main_worker_gpt(gpu, ngpus_per_node, args):
             self.att = Q_MultiHeadAttention(d_model, n_heads, bit_config)
             self.fcn = Q_FeedForward(d_model, bit_config)
             self.dropout = nn.Dropout(0.2)
+
+        def set_param(self, original_block):
+            # original_block is a GPTBlock from the original model
+            # It has ln1, ln2, att, fcn
+            # We need to set parameters for att and fcn from the original block.
+            self.ln1.load_state_dict(original_block.ln1.state_dict())
+            self.ln2.load_state_dict(original_block.ln2.state_dict())
+
+            self.att.set_param(original_block.att)
+            self.fcn.set_param(original_block.fcn)
 
         def forward(self, x):
             att_out = self.att(self.ln1(x))
@@ -505,50 +529,65 @@ def main_worker_gpt(gpu, ngpus_per_node, args):
             return emb
 
     class Q_GPT(nn.Module):
-        def __init__(self, model, bit_config):
+        def __init__(self, model):
             super().__init__()
             d_model = model.d_model
             n_layers = model.n_layers
             n_heads = model.n_heads
             vocab_size = model.vocab_size
 
-            self.quant_input = QuantAct(activation_bit=bit_config['quant_input'])
-            self.wte = QuantEmbedding(vocab_size, d_model, weight_bit=bit_config['wte.quant_weight'])
-            self.wpe = model.wpe
-            self.quant_act_wpe = QuantAct(activation_bit=bit_config['wpe.quant_act'])
+            # Quantized input activation
+            self.quant_input = QuantAct()
 
-            self.blocks = nn.ModuleList(
-                [Q_GPTBlock(d_model, n_heads, bit_config=bit_config) for _ in range(n_layers)]
-            )
-
-            self.quant_act_output = QuantAct(activation_bit=bit_config['quant_act_output'])
-            self.linear1 = QuantLinear(weight_bit=bit_config['linear1.quant_weight'])
-            self.linear1.set_param(model.linear1)
-
+            # Quantized embedding
+            self.wte = QuantEmbedding(vocab_size, d_model)
+            # set_param if implemented, or just copy weights
             with torch.no_grad():
                 self.wte.weight.copy_(model.wte.weight.data)
 
+            # Positional encoding (not trainable, just quantize output)
+            self.wpe = model.wpe
+            self.quant_act_wpe = QuantAct()
+
+            # Quantized GPT Blocks
+            self.blocks = nn.ModuleList([Q_GPTBlock(d_model, n_heads) for _ in range(n_layers)])
+            # Each Q_GPTBlock should have a set_param method
+            # that sets parameters from the corresponding original block if needed.
+
+            # Quantize output activation and final linear
+            self.quant_act_output = QuantAct()
+            self.quant_output = QuantLinear()
+            self.quant_output.set_param(model.linear1)
+
+        def set_param(self, original_gpt):
+            # original_gpt is the GPT model
+            # set parameters for each block
+            for i in range(self.n_layers):
+                self.blocks[i].set_param(original_gpt.blocks[i])
+            # wte and wpe are already set (wpe has no params)
+            # quant_output is already set
+            # If you'd like to handle layernorm, etc., do so here if needed.
+            # If the original model had layernorm parameters for each block's ln1, ln2,
+            # they've already been handled in Q_GPTBlock's set_param method.
+
         def forward(self, x, targets=None):
-            x, act_sf = self.quant_input(x.float())
+            x, act_scaling_factor = self.quant_input(x.float())
             x = self.wte(x.long())
-            # Apply positional encoding directly to the embeddings:
             x = self.wpe(x)
-            x, pesf = self.quant_act_wpe(x)
+            x, wpe_act_sf = self.quant_act_wpe(x)
 
             for block in self.blocks:
-                logging.info(f"Block: {block}")
-                x = block(x)
+                x, act_scaling_factor = block(x)
 
-            x, act_sf = self.quant_act_output(x)
+            x, act_scaling_factor = self.quant_act_output(x, act_scaling_factor)
             B, T, C = x.shape
             x = x.view(B*T, C)
-            x = self.linear1(x, act_sf)
+            x = self.quant_output(x, act_scaling_factor)
 
             loss = None
             if targets is not None:
                 targets = targets.view(B*T)
                 loss = F.cross_entropy(x, targets)
-
             return x, loss
 
     bit_config_gpt_uniform8 = {
@@ -625,7 +664,15 @@ def main_worker_gpt(gpu, ngpus_per_node, args):
     base_model = GPT(vocab_size=vocab_size, d_model=d_model, n_heads=n_heads, n_layers=n_layers).to(device)
     logging.info(base_model)
 
-    model = Q_GPT(base_model, bit_config_gpt_uniform8).to(device)
+    for name, m in base_model.named_modules():
+        logging.info(f"Old Module: {name}")
+
+    model = Q_GPT(base_model).to(device)
+    model.set_param(base_model)
+
+    for name, m in model.named_modules():
+        logging.info(f"New Module: {name}")
+
     logging.info(model)
 
     logging.info(args)
@@ -798,13 +845,22 @@ def main_worker(gpu, ngpus_per_node, args):
 
     quantize_arch = quantize_arch_dict[args.arch]
 
+    for name, m in model.named_modules():
+        logging.info(f"Module Old: {name}")
+
+
     model = quantize_arch(model)
+
+    for name, m in model.named_modules():
+        logging.info(f"Module New: {name}")
 
     bit_config = bit_config_dict["bit_config_" + args.arch + "_" + args.quant_scheme]
     name_counter = 0
 
     for name, m in model.named_modules():
+        logging.info(f"Module: {name}")
         if name in bit_config.keys():
+            logging.info(f"Setting quantization parameters for {name}")
             name_counter += 1
             setattr(m, 'quant_mode', 'symmetric')
             setattr(m, 'bias_bit', args.bias_bit)
