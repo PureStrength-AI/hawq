@@ -193,7 +193,10 @@ def main():
     args.distributed = args.world_size > 1 or args.multiprocessing_distributed
 
     ngpus_per_node = torch.cuda.device_count()
-    if args.multiprocessing_distributed:
+
+    if args.arch == 'gpt':
+        main_worker_gpt(args.gpu, ngpus_per_node, args)
+    elif args.multiprocessing_distributed:
         # Since we have ngpus_per_node processes per node, the total world_size
         # needs to be adjusted accordingly
         args.world_size = ngpus_per_node * args.world_size
@@ -204,6 +207,433 @@ def main():
         # Simply call main_worker function
         main_worker(args.gpu, ngpus_per_node, args)
 
+
+def main_worker_gpt(gpu, ngpus_per_node, args):
+    import math
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+    import time
+    import os
+    import logging
+    from torch.nn.parameter import Parameter
+    from torch.optim import AdamW
+
+    # Set up device
+    args.gpu = gpu
+    if args.gpu is not None:
+        logging.info("Use GPU: {} for training".format(args.gpu))
+        device = torch.device("cuda", args.gpu)
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Ensure save_path exists
+    if not os.path.exists(args.save_path):
+        os.makedirs(args.save_path)
+
+    # -----------------------------
+    # Data Loading and Tokenization
+    # -----------------------------
+    import tiktoken
+    tokenizer = tiktoken.get_encoding('gpt2')
+    vocab_size = tokenizer.n_vocab
+
+    data_dir = "data.txt"
+    with open(data_dir, 'r', encoding='utf-8') as f:
+        text = f.read()
+
+    data = torch.tensor(tokenizer.encode(text), dtype=torch.long)
+
+    train_batch_size = args.batch_size if args.batch_size is not None else 1
+    eval_batch_size = 1
+    context_length = 256
+    train_split = 0.7
+    n_data = len(data)
+    train_data = data[:int(n_data * train_split)]
+    eval_data = data[int(n_data * train_split):]
+
+    class DataLoader:
+        def __init__(self, tokens, batch_size, context_length):
+            self.tokens = tokens
+            self.batch_size = batch_size
+            self.context_length = context_length
+            self.current_position = 0
+
+        def get_batch(self):
+            b, c = self.batch_size, self.context_length
+            start_pos = self.current_position
+            end_pos = self.current_position + b * c + 1
+
+            add_data = -1
+            if end_pos > len(self.tokens):
+                add_data = end_pos - len(self.tokens)
+                end_pos = len(self.tokens)
+
+            d = self.tokens[start_pos:end_pos]
+            if add_data != -1:
+                d = torch.cat([d, self.tokens[:add_data]])
+
+            x = (d[:-1]).view(b, c)
+            y = (d[1:]).view(b, c)
+
+            self.current_position += b * c
+            if self.current_position > len(self.tokens) - 1:
+                self.current_position = 0
+
+            return x.to(device), y.to(device)
+
+    train_loader = DataLoader(train_data, train_batch_size, context_length)
+    eval_loader = DataLoader(eval_data, eval_batch_size, context_length)
+
+    # -----------------------------
+    # Model Definitions (GPT & Q_GPT)
+    # -----------------------------
+    d_model = 512
+    n_heads = 4
+    n_layers = 3
+
+    class PositionalEncoding(nn.Module):
+        def __init__(self, context_length, d_model):
+            super().__init__()
+            pe = torch.zeros(context_length, d_model)
+            position = torch.arange(0, context_length, dtype=torch.float).unsqueeze(1)
+            div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+            pe[:, 0::2] = torch.sin(position * div_term)
+            pe[:, 1::2] = torch.cos(position * div_term)
+            pe = pe.unsqueeze(0)
+            self.register_buffer('pe', pe)
+
+        def forward(self, x):
+            return x + self.pe[:, :x.size(1), :]
+
+    class MultiHeadAttention(nn.Module):
+        def __init__(self, d_model, n_heads):
+            super().__init__()
+            self.n_heads = n_heads
+            self.head_dim = d_model // n_heads
+            assert (n_heads * self.head_dim == d_model)
+            self.query = nn.Linear(d_model, d_model)
+            self.key = nn.Linear(d_model, d_model)
+            self.value = nn.Linear(d_model, d_model)
+            self.fc_out = nn.Linear(d_model, d_model)
+            self.dropout = nn.Dropout(0.2)
+
+        def forward(self, inputs):
+            B, seq_length, d_model = inputs.shape
+            Q = self.query(inputs).view(B, seq_length, self.n_heads, self.head_dim).permute(0, 2, 1, 3)
+            K = self.key(inputs).view(B, seq_length, self.n_heads, self.head_dim).permute(0, 2, 1, 3)
+            V = self.value(inputs).view(B, seq_length, self.n_heads, self.head_dim).permute(0, 2, 1, 3)
+            scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            mask = torch.triu(torch.ones(seq_length, seq_length), diagonal=1).bool().to(inputs.device)
+            scores = scores.masked_fill(mask, float('-inf'))
+            att_weights = torch.softmax(scores, dim=-1)
+            att_output = torch.matmul(self.dropout(att_weights), V)
+            att_output = att_output.permute(0, 2, 1, 3).contiguous().view(B, seq_length, d_model)
+            out = self.fc_out(att_output)
+            return out
+
+    class GPTBlock(nn.Module):
+        def __init__(self, d_model, n_heads):
+            super().__init__()
+            self.att = MultiHeadAttention(d_model, n_heads)
+            self.ln1 = nn.LayerNorm(d_model)
+            self.ln2 = nn.LayerNorm(d_model)
+            self.dropout = nn.Dropout(0.2)
+            self.fcn = nn.Sequential(
+                nn.Linear(d_model, 4 * d_model),
+                nn.GELU(),
+                nn.Linear(4 * d_model, d_model)
+            )
+
+        def forward(self, logits):
+            att_logits = self.att(self.ln1(logits))
+            logits = logits + self.dropout(att_logits)
+            fcn_logits = self.fcn(self.ln2(logits))
+            logits = logits + self.dropout(fcn_logits)
+            return logits
+
+    class GPT(nn.Module):
+        def __init__(self, vocab_size, d_model, n_heads, n_layers):
+            super().__init__()
+            self.vocab_size = vocab_size
+            self.d_model = d_model
+            self.n_heads = n_heads
+            self.n_layers = n_layers
+            self.wte = nn.Embedding(vocab_size, d_model)
+            self.wpe = PositionalEncoding(context_length, d_model)
+            self.blocks = nn.ModuleList([GPTBlock(d_model, n_heads) for _ in range(n_layers)])
+            self.linear1 = nn.Linear(d_model, vocab_size)
+
+        def forward(self, inputs, targets=None):
+            logits = self.wte(inputs)
+            logits = self.wpe(logits)
+            for block in self.blocks:
+                logits = block(logits)
+            logits = self.linear1(logits)
+            loss = None
+            if targets is not None:
+                B, T, C = logits.shape
+                logits = logits.view(B * T, C)
+                targets = targets.view(B * T)
+                loss = F.cross_entropy(logits, targets)
+            return logits, loss
+
+        def generate(self, inputs, max_new_tokens):
+            output = inputs.clone()
+            for _ in range(max_new_tokens):
+                current_seq_length = output.size(1)
+                if current_seq_length > context_length:
+                    inputs_trunc = output[:, -context_length:]
+                else:
+                    inputs_trunc = output
+                logits, _ = self(inputs_trunc)
+                logits = logits[:, -1, :]
+                probs = F.softmax(logits, dim=1)
+                idx_next = torch.multinomial(probs, num_samples=1)
+                output = torch.cat([output, idx_next], dim=1)
+            return [tokenizer.decode(o.tolist()) for o in output]
+
+    # Q_GPT classes
+    class Q_MultiHeadAttention(nn.Module):
+        def __init__(self, dim, n_heads, bit_config):
+            super().__init__()
+            self.n_heads = n_heads
+            self.dim = dim
+            self.head_dim = dim // n_heads
+            self.query = QuantLinear(weight_bit=bit_config['blocks.*.att.query.quant_weight'])
+            self.key = QuantLinear(weight_bit=bit_config['blocks.*.att.key.quant_weight'])
+            self.value = QuantLinear(weight_bit=bit_config['blocks.*.att.value.quant_weight'])
+            self.fc_out = QuantLinear(weight_bit=bit_config['blocks.*.att.fc_out.quant_weight'])
+            self.quant_act = QuantAct(activation_bit=bit_config['blocks.*.att.query.quant_act'])
+            self.quant_act_int32 = QuantAct(activation_bit=bit_config['blocks.*.att.quant_act_int32'])
+            self.dropout = nn.Dropout(0.2)
+
+        def forward(self, x):
+            B, seq_len, _ = x.shape
+            q, qs = self.quant_act(self.query(x))
+            k, ks = self.quant_act(self.key(x))
+            v, vs = self.quant_act(self.value(x))
+            q = q.view(B, seq_len, self.n_heads, self.head_dim).transpose(1,2)
+            k = k.view(B, seq_len, self.n_heads, self.head_dim).transpose(1,2)
+            v = v.view(B, seq_len, self.n_heads, self.head_dim).transpose(1,2)
+            scores = torch.matmul(q, k.transpose(-1,-2)) / (self.head_dim**0.5)
+            mask = torch.triu(torch.ones(seq_len, seq_len), diagonal=1).bool().to(x.device)
+            scores = scores.masked_fill(mask, float('-inf'))
+            att_weights = torch.softmax(scores, dim=-1)
+            out = torch.matmul(att_weights, v)
+            out = out.transpose(1,2).contiguous().view(B, seq_len, self.dim)
+            out, outs = self.quant_act_int32(self.fc_out(out, vs))
+            return out
+
+    class Q_FeedForward(nn.Module):
+        def __init__(self, dim, bit_config):
+            super().__init__()
+            self.quant_act = QuantAct(activation_bit=bit_config['blocks.*.fcn.0.quant_act'])
+            self.quant_act_int32 = QuantAct(activation_bit=bit_config['blocks.*.fcn.quant_act_int32'])
+            self.linear1 = QuantLinear(weight_bit=bit_config['blocks.*.fcn.0.quant_weight'])
+            self.linear2 = QuantLinear(weight_bit=bit_config['blocks.*.fcn.2.quant_weight'])
+            self.activation = nn.GELU()
+
+        def forward(self, x):
+            x, xs = self.quant_act(self.linear1(x))
+            x = self.activation(x)
+            x, x2s = self.quant_act_int32(self.linear2(x, xs))
+            return x
+
+    class Q_GPTBlock(nn.Module):
+        def __init__(self, d_model, n_heads, bit_config):
+            super().__init__()
+            self.ln1 = nn.LayerNorm(d_model)
+            self.ln2 = nn.LayerNorm(d_model)
+            self.att = Q_MultiHeadAttention(d_model, n_heads, bit_config)
+            self.fcn = Q_FeedForward(d_model, bit_config)
+            self.dropout = nn.Dropout(0.2)
+
+        def forward(self, x):
+            att_out = self.att(self.ln1(x))
+            x = x + self.dropout(att_out)
+            ff_out = self.fcn(self.ln2(x))
+            x = x + self.dropout(ff_out)
+            return x
+
+    class QuantEmbedding(nn.Module):
+        def __init__(self, num_embeddings, embedding_dim, weight_bit=8):
+            super().__init__()
+            self.num_embeddings = num_embeddings
+            self.embedding_dim = embedding_dim
+            self.weight_bit = weight_bit
+            self.weight = Parameter(torch.empty(num_embeddings, embedding_dim))
+            nn.init.normal_(self.weight, mean=0, std=embedding_dim**-0.5)
+            self.register_buffer('weight_scaling_factor', torch.zeros(1))
+
+        def forward(self, x):
+            w_min = self.weight.data.min()
+            w_max = self.weight.data.max()
+            scale = symmetric_linear_quantization_params(self.weight_bit, w_min, w_max)
+            w_int = SymmetricQuantFunction.apply(self.weight, self.weight_bit, scale)
+            emb = F.embedding(x, w_int) * scale
+            return emb
+
+    class Q_GPT(nn.Module):
+        def __init__(self, model, bit_config):
+            super().__init__()
+            d_model = model.d_model
+            n_layers = model.n_layers
+            n_heads = model.n_heads
+            vocab_size = model.vocab_size
+
+            self.quant_input = QuantAct(activation_bit=bit_config['quant_input'])
+            self.wte = QuantEmbedding(vocab_size, d_model, weight_bit=bit_config['wte.quant_weight'])
+            self.wpe = model.wpe
+            self.quant_act_wpe = QuantAct(activation_bit=bit_config['wpe.quant_act'])
+
+            self.blocks = nn.ModuleList(
+                [Q_GPTBlock(d_model, n_heads, bit_config=bit_config) for _ in range(n_layers)]
+            )
+
+            self.quant_act_output = QuantAct(activation_bit=bit_config['quant_act_output'])
+            self.linear1 = QuantLinear(weight_bit=bit_config['linear1.quant_weight'])
+            self.linear1.set_param(model.linear1)
+
+            with torch.no_grad():
+                self.wte.weight.copy_(model.wte.weight.data)
+
+        def forward(self, x, targets=None):
+            x, act_sf = self.quant_input(x.float())
+            x = self.wte(x.long())
+            pos_emb = self.wpe(torch.arange(x.size(1), device=x.device).unsqueeze(0))
+            pos_emb, pesf = self.quant_act_wpe(pos_emb)
+            x = x + pos_emb
+            for block in self.blocks:
+                x = block(x)
+            x, act_sf = self.quant_act_output(x)
+            B, T, C = x.shape
+            x = x.view(B*T, C)
+            x = self.linear1(x, act_sf)
+            loss = None
+            if targets is not None:
+                targets = targets.view(B*T)
+                loss = F.cross_entropy(x, targets)
+            return x, loss
+
+    bit_config_gpt_uniform8 = {
+        'quant_input': 8,
+        'wte.quant_weight': 8,
+        'wte.quant_act': 8,
+        'wpe.quant_act': 8,
+        'blocks.*.att.query.quant_weight': 8,
+        'blocks.*.att.query.quant_act': 8,
+        'blocks.*.att.key.quant_weight': 8,
+        'blocks.*.att.key.quant_act': 8,
+        'blocks.*.att.value.quant_weight': 8,
+        'blocks.*.att.value.quant_act': 8,
+        'blocks.*.att.fc_out.quant_weight': 8,
+        'blocks.*.att.fc_out.quant_act': 8,
+        'blocks.*.att.quant_act_int32': 16,
+        'blocks.*.fcn.0.quant_weight': 8,
+        'blocks.*.fcn.0.quant_act': 8,
+        'blocks.*.fcn.2.quant_weight': 8,
+        'blocks.*.fcn.2.quant_act': 8,
+        'blocks.*.fcn.quant_act_int32': 16,
+        'linear1.quant_weight': 8,
+        'linear1.quant_act': 8,
+        'quant_act_output': 8,
+        'quant_output': 8
+    }
+
+    # -----------------------------
+    # Create and Quantize Model
+    # -----------------------------
+    base_model = GPT(vocab_size=vocab_size, d_model=d_model, n_heads=n_heads, n_layers=n_layers).to(device)
+    model = Q_GPT(base_model, bit_config_gpt_uniform8).to(device)
+
+    # Set optimizer
+    lr = args.lr if args.lr is not None else 1e-3
+    optimizer = AdamW(model.parameters(), lr=lr)
+
+    # If resume is given
+    best_loss = float('inf')
+    if args.resume:
+        if os.path.isfile(args.resume):
+            logging.info("=> loading checkpoint '{}'".format(args.resume))
+            checkpoint = torch.load(args.resume, map_location=device)
+            model.load_state_dict(checkpoint['state_dict'], strict=False)
+            optimizer.load_state_dict(checkpoint['optimizer'])
+            if 'best_loss' in checkpoint:
+                best_loss = checkpoint['best_loss']
+            args.start_epoch = checkpoint['epoch']
+        else:
+            logging.info("=> no checkpoint found at '{}'".format(args.resume))
+
+    def validate(eval_loader, model):
+        model.eval()
+        losses = AverageMeter('Loss', ':.4e')
+        with torch.no_grad():
+            # Just one pass over eval_data
+            steps = 100  # fixed number of validation steps
+            for i in range(steps):
+                xb, yb = eval_loader.get_batch()
+                _, loss = model(xb, yb)
+                losses.update(loss.item(), xb.size(0))
+        return losses.avg
+
+    def train_one_epoch(train_loader, model, optimizer, epoch, args):
+        batch_time = AverageMeter('Time', ':6.3f')
+        losses = AverageMeter('Loss', ':.4e')
+        progress = ProgressMeter(
+            1000,
+            [batch_time, losses],
+            prefix="Epoch: [{}]".format(epoch))
+
+        model.train()
+        end = time.time()
+        # We'll do a fixed number of steps
+        steps_per_epoch = 1000
+        for i in range(steps_per_epoch):
+            xb, yb = train_loader.get_batch()
+            _, loss = model(xb, yb)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            losses.update(loss.item(), xb.size(0))
+            batch_time.update(time.time() - end)
+            end = time.time()
+
+            if i % args.print_freq == 0:
+                progress.display(i)
+
+        return losses.avg
+
+    def save_checkpoint(state, is_best, filename):
+        torch.save(state, filename + 'checkpoint_gpt.pth.tar')
+        if is_best:
+            import shutil
+            shutil.copyfile(filename + 'checkpoint_gpt.pth.tar', filename + 'model_best_gpt.pth.tar')
+
+    # -----------------------------
+    # Training Loop
+    # -----------------------------
+    epochs = args.epochs if args.epochs is not None else 2
+    global best_acc1  # even though we don't use acc, we keep for consistency
+    best_acc1 = 0
+
+    for epoch in range(args.start_epoch, epochs):
+        train_loss = train_one_epoch(train_loader, model, optimizer, epoch, args)
+        val_loss = validate(eval_loader, model)
+
+        is_best = val_loss < best_loss
+        if is_best:
+            best_loss = val_loss
+
+        save_checkpoint({
+            'epoch': epoch + 1,
+            'state_dict': model.state_dict(),
+            'best_loss': best_loss,
+            'optimizer': optimizer.state_dict(),
+        }, is_best, args.save_path)
+
+    logging.info("Training finished. Best val loss: {:.4f}".format(best_loss))
 
 def main_worker(gpu, ngpus_per_node, args):
     global best_acc1
@@ -760,7 +1190,6 @@ def loss_kd(output, target, teacher_output, args):
               F.cross_entropy(output, target) * (1. - alpha)
 
     return KD_loss
-
 
 if __name__ == '__main__':
     main()
