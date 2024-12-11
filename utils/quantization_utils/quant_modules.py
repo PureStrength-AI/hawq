@@ -83,6 +83,8 @@ class QuantLinear(Module):
         if type(x) is tuple:
             prev_act_scaling_factor = x[1]
             x = x[0]
+        if prev_act_scaling_factor is None:
+            prev_act_scaling_factor = torch.tensor([1.0], device=x.device)
 
         if self.quant_mode == "symmetric":
             self.weight_function = SymmetricQuantFunction.apply
