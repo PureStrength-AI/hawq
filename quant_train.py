@@ -501,19 +501,23 @@ def main_worker_gpt(gpu, ngpus_per_node, args):
         def forward(self, x, targets=None):
             x, act_sf = self.quant_input(x.float())
             x = self.wte(x.long())
-            pos_emb = self.wpe(torch.arange(x.size(1), device=x.device).unsqueeze(0))
-            pos_emb, pesf = self.quant_act_wpe(pos_emb)
-            x = x + pos_emb
+            # Apply positional encoding directly to the embeddings:
+            x = self.wpe(x)
+            x, pesf = self.quant_act_wpe(x)
+
             for block in self.blocks:
                 x = block(x)
+
             x, act_sf = self.quant_act_output(x)
             B, T, C = x.shape
             x = x.view(B*T, C)
             x = self.linear1(x, act_sf)
+
             loss = None
             if targets is not None:
                 targets = targets.view(B*T)
                 loss = F.cross_entropy(x, targets)
+
             return x, loss
 
     bit_config_gpt_uniform8 = {
@@ -545,7 +549,10 @@ def main_worker_gpt(gpu, ngpus_per_node, args):
     # Create and Quantize Model
     # -----------------------------
     base_model = GPT(vocab_size=vocab_size, d_model=d_model, n_heads=n_heads, n_layers=n_layers).to(device)
+    logging.info(base_model)
+
     model = Q_GPT(base_model, bit_config_gpt_uniform8).to(device)
+    logging.info(model)
 
     # Set optimizer
     lr = args.lr if args.lr is not None else 1e-3
@@ -619,7 +626,9 @@ def main_worker_gpt(gpu, ngpus_per_node, args):
     best_acc1 = 0
 
     for epoch in range(args.start_epoch, epochs):
+        logging.info("Training for Epoch: {}".format(epoch))
         train_loss = train_one_epoch(train_loader, model, optimizer, epoch, args)
+        logging.info("Train Loss: {:.4f}".format(train_loss))
         val_loss = validate(eval_loader, model)
 
         is_best = val_loss < best_loss
