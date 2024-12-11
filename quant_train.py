@@ -400,10 +400,24 @@ def main_worker_gpt(gpu, ngpus_per_node, args):
             self.n_heads = n_heads
             self.dim = dim
             self.head_dim = dim // n_heads
+
+            # Create the QuantLinear layers
             self.query = QuantLinear(weight_bit=bit_config['blocks.*.att.query.quant_weight'])
             self.key = QuantLinear(weight_bit=bit_config['blocks.*.att.key.quant_weight'])
             self.value = QuantLinear(weight_bit=bit_config['blocks.*.att.value.quant_weight'])
             self.fc_out = QuantLinear(weight_bit=bit_config['blocks.*.att.fc_out.quant_weight'])
+
+            # Initialize them from normal Linear layers
+            query_linear = nn.Linear(dim, dim)
+            key_linear = nn.Linear(dim, dim)
+            value_linear = nn.Linear(dim, dim)
+            fc_linear = nn.Linear(dim, dim)
+
+            self.query.set_param(query_linear)
+            self.key.set_param(key_linear)
+            self.value.set_param(value_linear)
+            self.fc_out.set_param(fc_linear)
+
             self.quant_act = QuantAct(activation_bit=bit_config['blocks.*.att.query.quant_act'])
             self.quant_act_int32 = QuantAct(activation_bit=bit_config['blocks.*.att.quant_act_int32'])
             self.dropout = nn.Dropout(0.2)
@@ -430,8 +444,16 @@ def main_worker_gpt(gpu, ngpus_per_node, args):
             super().__init__()
             self.quant_act = QuantAct(activation_bit=bit_config['blocks.*.fcn.0.quant_act'])
             self.quant_act_int32 = QuantAct(activation_bit=bit_config['blocks.*.fcn.quant_act_int32'])
+
             self.linear1 = QuantLinear(weight_bit=bit_config['blocks.*.fcn.0.quant_weight'])
             self.linear2 = QuantLinear(weight_bit=bit_config['blocks.*.fcn.2.quant_weight'])
+
+            # Initialize from standard Linear layers
+            l1 = nn.Linear(dim, 4*dim)
+            l2 = nn.Linear(4*dim, dim)
+            self.linear1.set_param(l1)
+            self.linear2.set_param(l2)
+
             self.activation = nn.GELU()
 
         def forward(self, x):
