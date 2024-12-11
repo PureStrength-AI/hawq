@@ -407,10 +407,10 @@ def main_worker_gpt(gpu, ngpus_per_node, args):
             self.head_dim = dim // n_heads
 
             # Create the QuantLinear layers
-            self.query = QuantLinear(weight_bit=bit_config['blocks.0.att.query.quant_weight'])
-            self.key = QuantLinear(weight_bit=bit_config['blocks.0.att.key.quant_weight'])
-            self.value = QuantLinear(weight_bit=bit_config['blocks.0.att.value.quant_weight'])
-            self.fc_out = QuantLinear(weight_bit=bit_config['blocks.0.att.fc_out.quant_weight'])
+            self.query = QuantLinear(weight_bit=bit_config['blocks.0.att.query'])
+            self.key = QuantLinear(weight_bit=bit_config['blocks.0.att.key'])
+            self.value = QuantLinear(weight_bit=bit_config['blocks.0.att.value'])
+            self.fc_out = QuantLinear(weight_bit=bit_config['blocks.0.att.fc_out'])
 
             # Initialize them from normal Linear layers
             query_linear = nn.Linear(dim, dim)
@@ -423,7 +423,7 @@ def main_worker_gpt(gpu, ngpus_per_node, args):
             self.value.set_param(value_linear)
             self.fc_out.set_param(fc_linear)
 
-            self.quant_act = QuantAct(activation_bit=bit_config['blocks.0.att.query.quant_act'])
+            self.quant_act = QuantAct(activation_bit=bit_config['blocks.0.att.quant_act'])
             self.quant_act_int32 = QuantAct(activation_bit=bit_config['blocks.0.att.quant_act_int32'])
             self.dropout = nn.Dropout(0.2)
 
@@ -457,11 +457,11 @@ def main_worker_gpt(gpu, ngpus_per_node, args):
     class Q_FeedForward(nn.Module):
         def __init__(self, dim, bit_config):
             super().__init__()
-            self.quant_act = QuantAct(activation_bit=bit_config['blocks.0.fcn.0.quant_act'])
+            self.quant_act = QuantAct(activation_bit=bit_config['blocks.0.fcn.quant_act'])
             self.quant_act_int32 = QuantAct(activation_bit=bit_config['blocks.0.fcn.quant_act_int32'])
 
-            self.linear1 = QuantLinear(weight_bit=bit_config['blocks.0.fcn.0.quant_weight'])
-            self.linear2 = QuantLinear(weight_bit=bit_config['blocks.0.fcn.2.quant_weight'])
+            self.linear1 = QuantLinear(weight_bit=bit_config['blocks.0.fcn.linear1'])
+            self.linear2 = QuantLinear(weight_bit=bit_config['blocks.0.fcn.linear2'])
 
             # Temporary initialization, set_param will overwrite these
             l1 = nn.Linear(dim, 4*dim)
@@ -508,7 +508,7 @@ def main_worker_gpt(gpu, ngpus_per_node, args):
             x = x + self.dropout(att_out)
             ff_out = self.fcn(self.ln2(x))
             x = x + self.dropout(ff_out)
-            return x
+            return x  # no act_scaling_factor returned
 
     class QuantEmbedding(nn.Module):
         def __init__(self, num_embeddings, embedding_dim, weight_bit=8):
@@ -529,7 +529,7 @@ def main_worker_gpt(gpu, ngpus_per_node, args):
             return emb
 
     class Q_GPT(nn.Module):
-        def __init__(self, model):
+        def __init__(self, model, bit_config):
             super().__init__()
             d_model = model.d_model
             n_layers = model.n_layers
@@ -550,7 +550,8 @@ def main_worker_gpt(gpu, ngpus_per_node, args):
             self.quant_act_wpe = QuantAct()
 
             # Quantized GPT Blocks
-            self.blocks = nn.ModuleList([Q_GPTBlock(d_model, n_heads) for _ in range(n_layers)])
+            self.blocks = nn.ModuleList([Q_GPTBlock(d_model, n_heads, bit_config=bit_config) for _ in range(n_layers)])
+            self.n_layers = n_layers
             # Each Q_GPTBlock should have a set_param method
             # that sets parameters from the corresponding original block if needed.
 
@@ -571,14 +572,18 @@ def main_worker_gpt(gpu, ngpus_per_node, args):
             # they've already been handled in Q_GPTBlock's set_param method.
 
         def forward(self, x, targets=None):
+            # If you don't need act_scaling_factor at all, remove it here
             x, act_scaling_factor = self.quant_input(x.float())
             x = self.wte(x.long())
             x = self.wpe(x)
+            # If quant_act_wpe also returns act_scaling_factor and you don't need it:
             x, wpe_act_sf = self.quant_act_wpe(x)
 
+            # Now just forward through the blocks without act_scaling_factor
             for block in self.blocks:
-                x, act_scaling_factor = block(x)
+                x = block(x)
 
+            # Same at the output
             x, act_scaling_factor = self.quant_act_output(x, act_scaling_factor)
             B, T, C = x.shape
             x = x.view(B*T, C)
@@ -590,70 +595,66 @@ def main_worker_gpt(gpu, ngpus_per_node, args):
                 loss = F.cross_entropy(x, targets)
             return x, loss
 
-    bit_config_gpt_uniform8 = {
+    module_config = {
         'quant_input': 8,
-        'wte.quant_weight': 8,
-        'wte.quant_act': 8,
-        'wpe.quant_act': 8,
-        'blocks.0.att.query.quant_weight': 8,
-        'blocks.0.att.query.quant_act': 8,
-        'blocks.0.att.key.quant_weight': 8,
-        'blocks.0.att.key.quant_act': 8,
-        'blocks.0.att.value.quant_weight': 8,
-        'blocks.0.att.value.quant_act': 8,
-        'blocks.0.att.fc_out.quant_weight': 8,
-        'blocks.0.att.fc_out.quant_act': 8,
-        'blocks.0.att.dropout.quant_act': 8,
+        'wte': 8,
+        'wpe': 8,
+        'quant_act_wpe': 8,
+        'blocks': 8,
+        'blocks.0': 8,
+        'blocks.0.ln1': 8,
+        'blocks.0.ln2': 8,
+        'blocks.0.att': 8,
+        'blocks.0.att.query': 8,
+        'blocks.0.att.key': 8,
+        'blocks.0.att.value': 8,
+        'blocks.0.att.fc_out': 8,
+        'blocks.0.att.quant_act': 8,
         'blocks.0.att.quant_act_int32': 16,
-        'blocks.0.ln1.quant_act': 8,
-        'blocks.0.ln2.quant_act': 8,
-        'blocks.0.fcn.0.quant_weight': 8,
-        'blocks.0.fcn.0.quant_act': 8,
-        'blocks.0.fcn.1.quant_act': 8,
-        'blocks.0.fcn.2.quant_weight': 8,
-        'blocks.0.fcn.2.quant_act': 8,
+        'blocks.0.att.dropout': 8,
+        'blocks.0.fcn': 8,
+        'blocks.0.fcn.quant_act': 8,
         'blocks.0.fcn.quant_act_int32': 16,
-        'blocks.0.dropout.quant_act': 8,
-        'blocks.1.att.query.quant_weight': 8,
-        'blocks.1.att.query.quant_act': 8,
-        'blocks.1.att.key.quant_weight': 8,
-        'blocks.1.att.key.quant_act': 8,
-        'blocks.1.att.value.quant_weight': 8,
-        'blocks.1.att.value.quant_act': 8,
-        'blocks.1.att.fc_out.quant_weight': 8,
-        'blocks.1.att.fc_out.quant_act': 8,
-        'blocks.1.att.dropout.quant_act': 8,
+        'blocks.0.fcn.linear1': 8,
+        'blocks.0.fcn.linear2': 8,
+        'blocks.0.fcn.activation': 8,
+        'blocks.0.dropout': 8,
+        'blocks.1': 8,
+        'blocks.1.ln1': 8,
+        'blocks.1.ln2': 8,
+        'blocks.1.att': 8,
+        'blocks.1.att.query': 8,
+        'blocks.1.att.key': 8,
+        'blocks.1.att.value': 8,
+        'blocks.1.att.fc_out': 8,
+        'blocks.1.att.quant_act': 8,
         'blocks.1.att.quant_act_int32': 16,
-        'blocks.1.ln1.quant_act': 8,
-        'blocks.1.ln2.quant_act': 8,
-        'blocks.1.fcn.0.quant_weight': 8,
-        'blocks.1.fcn.0.quant_act': 8,
-        'blocks.1.fcn.1.quant_act': 8,
-        'blocks.1.fcn.2.quant_weight': 8,
-        'blocks.1.fcn.2.quant_act': 8,
+        'blocks.1.att.dropout': 8,
+        'blocks.1.fcn': 8,
+        'blocks.1.fcn.quant_act': 8,
         'blocks.1.fcn.quant_act_int32': 16,
-        'blocks.1.dropout.quant_act': 8,
-        'blocks.2.att.query.quant_weight': 8,
-        'blocks.2.att.query.quant_act': 8,
-        'blocks.2.att.key.quant_weight': 8,
-        'blocks.2.att.key.quant_act': 8,
-        'blocks.2.att.value.quant_weight': 8,
-        'blocks.2.att.value.quant_act': 8,
-        'blocks.2.att.fc_out.quant_weight': 8,
-        'blocks.2.att.fc_out.quant_act': 8,
-        'blocks.2.att.dropout.quant_act': 8,
+        'blocks.1.fcn.linear1': 8,
+        'blocks.1.fcn.linear2': 8,
+        'blocks.1.fcn.activation': 8,
+        'blocks.1.dropout': 8,
+        'blocks.2': 8,
+        'blocks.2.ln1': 8,
+        'blocks.2.ln2': 8,
+        'blocks.2.att': 8,
+        'blocks.2.att.query': 8,
+        'blocks.2.att.key': 8,
+        'blocks.2.att.value': 8,
+        'blocks.2.att.fc_out': 8,
+        'blocks.2.att.quant_act': 8,
         'blocks.2.att.quant_act_int32': 16,
-        'blocks.2.ln1.quant_act': 8,
-        'blocks.2.ln2.quant_act': 8,
-        'blocks.2.fcn.0.quant_weight': 8,
-        'blocks.2.fcn.0.quant_act': 8,
-        'blocks.2.fcn.1.quant_act': 8,
-        'blocks.2.fcn.2.quant_weight': 8,
-        'blocks.2.fcn.2.quant_act': 8,
+        'blocks.2.att.dropout': 8,
+        'blocks.2.fcn': 8,
+        'blocks.2.fcn.quant_act': 8,
         'blocks.2.fcn.quant_act_int32': 16,
-        'blocks.2.dropout.quant_act': 8,
-        'linear1.quant_weight': 8,
-        'linear1.quant_act': 8,
+        'blocks.2.fcn.linear1': 8,
+        'blocks.2.fcn.linear2': 8,
+        'blocks.2.fcn.activation': 8,
+        'blocks.2.dropout': 8,
         'quant_act_output': 8,
         'quant_output': 8
     }
@@ -667,7 +668,7 @@ def main_worker_gpt(gpu, ngpus_per_node, args):
     for name, m in base_model.named_modules():
         logging.info(f"Old Module: {name}")
 
-    model = Q_GPT(base_model).to(device)
+    model = Q_GPT(base_model, bit_config=module_config).to(device)
     model.set_param(base_model)
 
     for name, m in model.named_modules():
@@ -679,7 +680,7 @@ def main_worker_gpt(gpu, ngpus_per_node, args):
     
     for name, m in model.named_modules():
         logging.info(f"Module: {name}")
-        if name in bit_config_gpt_uniform8.keys():
+        if name in module_config.keys():
             logging.info(f"Setting quantization parameters for {name}")
             setattr(m, 'quant_mode', 'symmetric')
             setattr(m, 'bias_bit', args.bias_bit)
@@ -691,7 +692,7 @@ def main_worker_gpt(gpu, ngpus_per_node, args):
             setattr(m, 'fix_flag', False)
             setattr(m, 'fixed_point_quantization', args.fixed_point_quantization)
 
-            bit_conf = bit_config_gpt_uniform8[name]
+            bit_conf = module_config[name]
             bitwidth = bit_conf[0] if isinstance(bit_conf, tuple) else bit_conf
 
             if hasattr(m, 'activation_bit'):

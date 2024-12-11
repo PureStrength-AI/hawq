@@ -117,7 +117,6 @@ class QuantLinear(Module):
                 self.weight_integer = self.weight_function(self.weight, self.weight_bit, self.fc_scaling_factor)
 
                 bias_scaling_factor = self.fc_scaling_factor.view(1, -1) * prev_act_scaling_factor.view(1, -1)
-                print("BIAS Here - ", self.bias, self.bias_bit, bias_scaling_factor)
                 self.bias_integer = self.weight_function(self.bias, self.bias_bit, bias_scaling_factor)
             else:
                 raise Exception('For weight, we only support symmetric quantization.')
