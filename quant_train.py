@@ -533,9 +533,6 @@ def main_worker_gpt(gpu, ngpus_per_node, args):
             n_heads = model.n_heads
             vocab_size = model.vocab_size
 
-            # Quantized input activation
-            self.quant_input = QuantAct()
-
             # Quantized embedding
             self.wte = QuantEmbedding(vocab_size, d_model)
             # set_param if implemented, or just copy weights
@@ -544,13 +541,15 @@ def main_worker_gpt(gpu, ngpus_per_node, args):
 
             # Positional encoding (not trainable, just quantize output)
             self.wpe = model.wpe
-            self.quant_act_wpe = QuantAct()
+            # self.quant_act_wpe = QuantAct()
 
             # Quantized GPT Blocks
             self.blocks = nn.ModuleList([Q_GPTBlock(d_model, n_heads, bit_config=bit_config) for _ in range(n_layers)])
+            # self.blocks = model.blocks
             self.n_layers = n_layers
             # Each Q_GPTBlock should have a set_param method
             # that sets parameters from the corresponding original block if needed.
+            # self.linear1 = nn.Linear(d_model, vocab_size)
 
             # Quantize output activation and final linear
             self.quant_act_output = QuantAct()
@@ -570,18 +569,15 @@ def main_worker_gpt(gpu, ngpus_per_node, args):
 
         def forward(self, x, targets=None):
             # If you don't need act_scaling_factor at all, remove it here
-            x, act_scaling_factor = self.quant_input(x.float())
-            x = self.wte(x.long())
+            x = self.wte(x)
             x = self.wpe(x)
-            # If quant_act_wpe also returns act_scaling_factor and you don't need it:
-            x, wpe_act_sf = self.quant_act_wpe(x)
 
             # Now just forward through the blocks without act_scaling_factor
             for block in self.blocks:
                 x = block(x)
 
-            # Same at the output
-            x, act_scaling_factor = self.quant_act_output(x, act_scaling_factor)
+            # # Same at the output
+            x, act_scaling_factor = self.quant_act_output(x)
             B, T, C = x.shape
             x = x.view(B*T, C)
             x = self.quant_output(x, act_scaling_factor)
@@ -593,10 +589,7 @@ def main_worker_gpt(gpu, ngpus_per_node, args):
             return x, loss
 
     module_config = {
-        'quant_input': 8,
         'wte': 8,
-        'wpe': 8,
-        'quant_act_wpe': 8,
         'blocks': 8,
         'blocks.0': 8,
         'blocks.0.ln1': 8,
@@ -1047,7 +1040,8 @@ def main_worker(gpu, ngpus_per_node, args):
             train_kd(train_loader, model, teacher, criterion, optimizer, epoch, val_loader,
                      args, ngpus_per_node, dataset_length)
         else:
-            train(train_loader, model, criterion, optimizer, epoch, args)
+            # train(train_loader, model, criterion, optimizer, epoch, args)
+            train_with_ortho_loss(train_loader, model, criterion, optimizer, epoch, args)
 
         acc1 = validate(val_loader, model, criterion, args)
 
@@ -1073,6 +1067,86 @@ def main_worker(gpu, ngpus_per_node, args):
                 'optimizer': optimizer.state_dict(),
             }, is_best, args.save_path)
 
+
+from torch.nn.functional import normalize
+
+def l2_reg_ortho_mat(mat, device):
+    """
+    SRIP function from 'Can We Gain More from Orthogonality Regularizations in Training Deep CNNs?,' 
+    https://arxiv.org/abs/1810.09102.
+    """
+    W = mat
+    cols = W[0].numel()
+    w1 = W.view(-1,cols)
+    wt = torch.transpose(w1,0,1)
+    m  = torch.matmul(wt,w1)
+    ident = Variable(torch.eye(cols,cols)).type(torch.HalfTensor).to(device)
+
+    w_tmp = (m - ident)
+    height = w_tmp.size(0)
+    u = normalize(w_tmp.new_empty(height).normal_(0,1), dim=0, eps=1e-12)
+    v = normalize(torch.matmul(w_tmp.t(), u), dim=0, eps=1e-12)
+    u = normalize(torch.matmul(w_tmp, v), dim=0, eps=1e-12)
+    sigma = torch.dot(u, torch.matmul(w_tmp, v))
+    return (sigma)**2
+
+def train_with_ortho_loss(train_loader, model, criterion, optimizer, epoch, args, lambda_ortho=0.01):
+    batch_time = AverageMeter('Time', ':6.3f')
+    data_time = AverageMeter('Data', ':6.3f')
+    losses = AverageMeter('Loss', ':.4e')
+    top1 = AverageMeter('Acc@1', ':6.2f')
+    top5 = AverageMeter('Acc@5', ':6.2f')
+    progress = ProgressMeter(
+        len(train_loader),
+        [batch_time, data_time, losses, top1, top5],
+        prefix="Epoch: [{}]".format(epoch))
+
+    # switch to train mode
+    if args.fix_BN:
+        model.eval()
+    else:
+        model.train()
+
+    end = time.time()
+    for i, (images, target) in enumerate(train_loader):
+        # measure data loading time
+        data_time.update(time.time() - end)
+
+        if args.gpu is not None:
+            images = images.cuda(args.gpu, non_blocking=True)
+        target = target.cuda(args.gpu, non_blocking=True)
+
+        # compute output
+        output = model(images)
+        main_loss = criterion(output, target)
+
+        # Compute orthogonality penalty for each layer
+        ortho_loss = 0
+        for name, param in model.named_parameters():
+            if "weight" in name and len(param.shape) > 1:  # Apply to weight matrices only
+                ortho_loss += l2_reg_ortho_mat(param, device=param.device)
+
+        # Combine main loss and orthogonality penalty
+        total_loss = main_loss + lambda_ortho * ortho_loss
+
+        # measure accuracy and record loss
+        acc1, acc5 = accuracy(output, target, topk=(1, 5))
+        losses.update(total_loss.item(), images.size(0))
+        top1.update(acc1[0], images.size(0))
+        top5.update(acc5[0], images.size(0))
+
+        # compute gradient and do SGD step
+        optimizer.zero_grad()
+        total_loss.backward()
+        optimizer.step()
+
+        # measure elapsed time
+        batch_time.update(time.time() - end)
+        end = time.time()
+
+        if i % args.print_freq == 0:
+            progress.display(i)
+    
 
 def train(train_loader, model, criterion, optimizer, epoch, args):
     batch_time = AverageMeter('Time', ':6.3f')
